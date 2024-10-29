@@ -1,5 +1,8 @@
 name: "Setup CDK Environment"
 description: "Sets up Node.js and CDK with caching"
+branding:
+  icon: "arrow-up-circle"
+  color: "blue"
 
 inputs:
   node-version:
@@ -22,6 +25,10 @@ inputs:
     description: "Working directory for npm commands"
     required: false
     default: "."
+  skip-dependencies:
+    description: "Skip installing dependencies"
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -37,10 +44,14 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
-        echo "Installing project dependencies..."
-        if ! npm ci; then
-          echo "::error::Failed to install dependencies. Check your package-lock.json and node_modules"
-          exit 1
+        if [ "${{ inputs.skip-dependencies }}" != "true" ]; then
+          echo "Installing project dependencies..."
+          if ! npm ci; then
+            echo "::error::Failed to install dependencies. Check your package-lock.json and node_modules"
+            exit 1
+          fi
+        else
+          echo "Skipping dependency installation..."
         fi
 
         echo "Installing AWS CDK version ${{ inputs.cdk-version }}..."

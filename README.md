@@ -18,7 +18,7 @@ steps:
     - name: Setup CDK Environment
       uses: banboniera/setup-cdk@v1
       with:
-        cdk-version: '2.161.0'
+        cdk-version: '2.164.1'
         aws-region: 'eu-central-1'
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -34,3 +34,4 @@ steps:
 | `aws-access-key-id` | AWS Access Key ID | true | |
 | `aws-secret-access-key` | AWS Secret Access Key | true | |
 | `working-directory` | Working directory for npm commands | false | `.` |
+| `skip-dependencies` | Skip installing dependencies | false | `true` |
