@@ -5,13 +5,6 @@ branding:
   color: "blue"
 
 inputs:
-  node-version:
-    description: "Node.js version to use"
-    required: false
-    default: "22"
-  cdk-version:
-    description: "AWS CDK version to install"
-    required: true
   aws-region:
     description: "AWS Region"
     required: true
@@ -21,12 +14,20 @@ inputs:
   aws-secret-access-key:
     description: "AWS Secret Access Key"
     required: true
+  node-version:
+    description: "Node.js version to use (if not specified, version 20 will be used)"
+    required: false
+    default: "20"
+  cdk-version:
+    description: "AWS CDK version to install (if not specified, latest version will be installed)"
+    required: false
+    default: "latest"
   working-directory:
-    description: "Working directory for npm commands"
+    description: "Working directory for npm commands (if not specified, current directory will be used)"
     required: false
     default: "."
   skip-dependencies:
-    description: "Skip installing dependencies"
+    description: "Skip installing dependencies (if not specified, dependencies will be installed)"
     required: false
     default: "true"
 
@@ -54,9 +55,14 @@ runs:
           echo "Skipping dependency installation..."
         fi
 
-        echo "Installing AWS CDK version ${{ inputs.cdk-version }}..."
-        if ! npm install -g aws-cdk@${{ inputs.cdk-version }}; then
-          echo "::error::Failed to install AWS CDK version ${{ inputs.cdk-version }}. Please verify the version exists"
+        echo "Installing AWS CDK..."
+        CDK_INSTALL_CMD="npm install -g aws-cdk"
+        if [ "${{ inputs.cdk-version }}" != "latest" ]; then
+          CDK_INSTALL_CMD="${CDK_INSTALL_CMD}@${{ inputs.cdk-version }}"
+        fi
+        
+        if ! eval $CDK_INSTALL_CMD; then
+          echo "::error::Failed to install AWS CDK. Please verify the version if specified"
           exit 1
         fi
 
