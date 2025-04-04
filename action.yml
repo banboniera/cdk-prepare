@@ -1,77 +1,149 @@
-name: "Setup CDK Environment"
-description: "Sets up Node.js and CDK with caching"
+name: 'CDK Prepare Environment'
+description: 'Prepares AWS CDK environment with optimized caching and minimal dependencies'
 branding:
-  icon: "arrow-up-circle"
-  color: "blue"
+  icon: 'arrow-up-circle'
+  color: 'blue'
 
 inputs:
   aws-region:
-    description: "AWS Region"
+    description: 'Target AWS region for deployment'
     required: true
-  aws-access-key-id:
-    description: "AWS Access Key ID"
+  role-to-assume:
+    description: 'AWS IAM role ARN to assume'
     required: true
-  aws-secret-access-key:
-    description: "AWS Secret Access Key"
-    required: true
+  synth-command:
+    description: 'CDK synthesis command (default: npm run synth)'
+    required: false
+    default: 'npm run synth'
+  artifact-name:
+    description: 'Name for the deployment artifact (default: cdk-deployment-package)'
+    required: false
+    default: 'cdk-deployment-package'
+  artifact-path:
+    description: 'Path to store deployment files (default: deployment)'
+    required: false
+    default: 'deployment'
   node-version:
-    description: "Node.js version to use (if not specified, version 20 will be used)"
+    description: 'Node.js version (default: 22)'
     required: false
-    default: "20"
-  cdk-version:
-    description: "AWS CDK version to install (if not specified, latest version will be installed)"
-    required: false
-    default: "latest"
-  working-directory:
-    description: "Working directory for npm commands (if not specified, current directory will be used)"
-    required: false
-    default: "."
-  skip-dependencies:
-    description: "Skip installing dependencies (if not specified, dependencies will be installed)"
-    required: false
-    default: "true"
+    default: '22'
+
+outputs:
+  stacks:
+    description: 'JSON array of stacks that were synthesized'
+    value: ${{ steps.stack-analysis.outputs.stacks }}
+  dependencies:
+    description: 'JSON object of stack dependencies'
+    value: ${{ steps.stack-analysis.outputs.dependencies }}
+  cache-hit:
+    description: 'Whether the npm cache was hit'
+    value: ${{ steps.setup-node.outputs.cache-hit }}
 
 runs:
   using: composite
   steps:
-    - name: Setup Node.js
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js ${{ inputs.node-version }}
+      id: setup-node
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
-        cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+        cache-dependency-path: package-lock.json
 
     - name: Install Dependencies
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        if [ "${{ inputs.skip-dependencies }}" != "true" ]; then
-          echo "Installing project dependencies..."
-          if ! npm ci; then
-            echo "::error::Failed to install dependencies. Check your package-lock.json and node_modules"
-            exit 1
-          fi
-        else
-          echo "Skipping dependency installation..."
-        fi
-
-        echo "Installing AWS CDK..."
-        CDK_INSTALL_CMD="npm install -g aws-cdk"
-        if [ "${{ inputs.cdk-version }}" != "latest" ]; then
-          CDK_INSTALL_CMD="${CDK_INSTALL_CMD}@${{ inputs.cdk-version }}"
-        fi
-        
-        if ! eval $CDK_INSTALL_CMD; then
-          echo "::error::Failed to install AWS CDK. Please verify the version if specified"
-          exit 1
-        fi
-
-        # Verify CDK installation
-        cdk --version || exit 1
+      run: npm ci --prefer-offline --no-audit
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ inputs.aws-access-key-id }}
-        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
         aws-region: ${{ inputs.aws-region }}
+        role-to-assume: ${{ inputs.role-to-assume }}
+
+    - name: Cache CDK Synth
+      id: cache-cdk-synth
+      uses: actions/cache@v4
+      with:
+        path: cdk.out
+        key: cdk-synth-${{ hashFiles('package-lock.json') }}
+
+    - name: Synthesize CDK stacks
+      if: steps.cache-cdk-synth.outputs.cache-hit != 'true'
+      shell: bash
+      run: ${{ inputs.synth-command }}
+
+    - name: Analyze stacks and dependencies
+      id: stack-analysis
+      shell: bash
+      run: |
+        if [ -f "cdk.out/manifest.json" ]; then
+          # Extract stacks and dependencies in a single jq operation
+          MANIFEST_ANALYSIS=$(jq -r '
+            {
+              stacks: (.artifacts | to_entries | 
+                map(select(.key | endswith(".assets") | not) | 
+                select(.key != "Tree")) | map(.key)),
+              dependencies: (.artifacts | to_entries | 
+                map(select(.key | endswith(".assets") | not) | 
+                select(.key != "Tree")) | 
+                map({key: .key, deps: (.value.dependencies | 
+                  if . then map(select(. | endswith(".assets") | not) | 
+                  select(. != "Tree")) else [] end)}) | 
+                from_entries)
+            } | 
+            to_entries | 
+            map("echo \"" + .key + "=" + (.value | @json) + "\" >> $GITHUB_OUTPUT") | 
+            .[]
+          ' cdk.out/manifest.json)
+          
+          eval "$MANIFEST_ANALYSIS"
+        else
+          echo "::error::manifest.json not found in cdk.out directory"
+          exit 1
+        fi
+
+    - name: Prepare deployment package
+      shell: bash
+      run: |
+        # Create deployment directory
+        mkdir -p ${{ inputs.artifact-path }}
+        
+        # Copy CDK output
+        cp -r cdk.out ${{ inputs.artifact-path }}/
+        
+        # Create minimal package.json
+        node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const minPkg = {
+            name: pkg.name,
+            version: pkg.version,
+            dependencies: {
+              "aws-cdk": pkg.dependencies["aws-cdk"] || pkg.devDependencies["aws-cdk"]
+            }
+          };
+          fs.writeFileSync("${{ inputs.artifact-path }}/package.json", JSON.stringify(minPkg, null, 2));
+        '
+        
+        # Install only production dependencies
+        cd ${{ inputs.artifact-path }}
+        npm install --production --no-package-lock
+        
+        # Optimize node_modules size
+        find node_modules -type d -name "test" -o -name "tests" -o -name "docs" -o -name "examples" | xargs rm -rf 2>/dev/null || true
+        find node_modules -type f -name "*.md" -o -name "*.markdown" -o -name "*.txt" -o -name "*.map" -o -name "*.ts" -not -name "*.d.ts" | xargs rm -f 2>/dev/null || true
+        
+        # Create a marker file with metadata
+        echo "{\"createdAt\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\", \"region\": \"${{ inputs.aws-region }}\"}" > metadata.json
+
+    - name: Upload deployment package
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.artifact-path }}
+        retention-days: 1
