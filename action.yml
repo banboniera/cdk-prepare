@@ -1,77 +1,121 @@
-name: "Setup CDK Environment"
-description: "Sets up Node.js and CDK with caching"
+name: 'CDK Prepare Environment'
+description: 'Sets up Node.js and AWS CDK with caching and optional dependency installation'
 branding:
-  icon: "arrow-up-circle"
-  color: "blue"
+  icon: 'arrow-up-circle'
+  color: 'blue'
 
 inputs:
   aws-region:
-    description: "AWS Region"
+    description: 'AWS Region'
     required: true
-  aws-access-key-id:
-    description: "AWS Access Key ID"
+  role-to-assume:
+    description: 'Role to assume'
     required: true
-  aws-secret-access-key:
-    description: "AWS Secret Access Key"
-    required: true
+  synth-command:
+    description: 'Command to synthesize CDK stacks'
+    required: false
+    default: 'npm run synth'
   node-version:
-    description: "Node.js version to use (if not specified, version 20 will be used)"
+    description: 'Node.js version to use (default: 22)'
     required: false
-    default: "20"
-  cdk-version:
-    description: "AWS CDK version to install (if not specified, latest version will be installed)"
-    required: false
-    default: "latest"
-  working-directory:
-    description: "Working directory for npm commands (if not specified, current directory will be used)"
-    required: false
-    default: "."
-  skip-dependencies:
-    description: "Skip installing dependencies (if not specified, dependencies will be installed)"
-    required: false
-    default: "true"
+    default: '22'
+
+outputs:
+  stacks:
+    description: 'JSON array of stacks that were synthesized'
+    value: ${{ steps.stack-analysis.outputs.stacks }}
+  dependencies:
+    description: 'JSON object of stack dependencies'
+    value: ${{ steps.stack-analysis.outputs.dependencies }}
 
 runs:
   using: composite
   steps:
-    - name: Setup Node.js
+    - name: Setup Node.js ${{ inputs.node-version }}
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
-        cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+        cache-dependency-path: package-lock.json
 
     - name: Install Dependencies
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        if [ "${{ inputs.skip-dependencies }}" != "true" ]; then
-          echo "Installing project dependencies..."
-          if ! npm ci; then
-            echo "::error::Failed to install dependencies. Check your package-lock.json and node_modules"
-            exit 1
-          fi
-        else
-          echo "Skipping dependency installation..."
-        fi
-
-        echo "Installing AWS CDK..."
-        CDK_INSTALL_CMD="npm install -g aws-cdk"
-        if [ "${{ inputs.cdk-version }}" != "latest" ]; then
-          CDK_INSTALL_CMD="${CDK_INSTALL_CMD}@${{ inputs.cdk-version }}"
-        fi
-        
-        if ! eval $CDK_INSTALL_CMD; then
-          echo "::error::Failed to install AWS CDK. Please verify the version if specified"
-          exit 1
-        fi
-
-        # Verify CDK installation
-        cdk --version || exit 1
+      run: npm ci
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ inputs.aws-access-key-id }}
-        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
         aws-region: ${{ inputs.aws-region }}
+        role-to-assume: ${{ inputs.role-to-assume }}
+
+    - name: Synthesize CDK stacks
+      shell: bash
+      run: ${{ inputs.synth-command }}
+
+    - name: Analyze stacks and dependencies
+      id: stack-analysis
+      shell: bash
+      run: |
+        if [ -f "cdk.out/manifest.json" ]; then
+          # Get stacks excluding .assets and Tree
+          STACKS=$(jq -r '
+            .artifacts | 
+            to_entries | 
+            map(select(.key | endswith(".assets") | not) | select(.key != "Tree")) | 
+            map(.key) | 
+            @json
+          ' cdk.out/manifest.json)
+          echo "stacks=$STACKS" >> $GITHUB_OUTPUT
+
+          # Create dependency graph - simplified approach
+          DEPENDENCIES=$(jq -r '
+            .artifacts | 
+            to_entries | 
+            map(select(.key | endswith(".assets") | not) | select(.key != "Tree")) | 
+            map({key: .key, deps: (.value.dependencies | map(select(. | endswith(".assets") | not) | select(. != "Tree")))}) | 
+            from_entries | 
+            @json
+          ' cdk.out/manifest.json)
+          echo "dependencies=$DEPENDENCIES" >> $GITHUB_OUTPUT
+        else
+          echo "::error::manifest.json not found in cdk.out directory"
+          exit 1
+        fi
+
+    - name: Prepare deployment package
+      shell: bash
+      run: |
+        # Create a directory for deployment
+        mkdir -p deployment
+
+        # Copy only what's needed for deployment
+        cp -r cdk.out deployment
+
+        # Include minimal package.json with just aws-cdk dependency
+        node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const minPkg = {
+            name: pkg.name,
+            version: pkg.version,
+            dependencies: {
+              "aws-cdk": pkg.devDependencies["aws-cdk"]
+            }
+          };
+          fs.writeFileSync("deployment/package.json", JSON.stringify(minPkg, null, 2));
+        '
+
+        # Install dependencies in deployment directory
+        cd deployment
+        npm install
+
+        # Clean up unnecessary files from node_modules
+        find node_modules -type d -name "test" -o -name "tests" -o -name "docs" -o -name "examples" | xargs rm -rf
+        find node_modules -type f -name "*.md" -o -name "*.markdown" -o -name "*.txt" -o -name "*.map" | xargs rm -f
+
+    - name: Upload deployment package
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdk-deployment-package
+        path: deployment
+        retention-days: 1
