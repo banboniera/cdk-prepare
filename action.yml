@@ -1,54 +1,40 @@
-name: 'CDK Prepare Environment'
-description: 'Prepares AWS CDK environment with optimized caching and minimal dependencies'
+name: "CDK Prepare Environment"
+description: "Prepares AWS CDK environment with optimized caching and minimal dependencies"
 branding:
-  icon: 'arrow-up-circle'
-  color: 'blue'
+  icon: "arrow-up-circle"
+  color: "blue"
 
 inputs:
   aws-region:
-    description: 'Target AWS region for deployment'
+    description: "Target AWS region for deployment"
     required: true
   role-to-assume:
-    description: 'AWS IAM role ARN to assume'
+    description: "AWS IAM role ARN to assume"
     required: true
   synth-command:
-    description: 'CDK synthesis command (default: npm run synth)'
+    description: "CDK synthesis command (default: npx cdk synth)"
     required: false
-    default: 'npm run synth'
+    default: "npx cdk synth"
   artifact-name:
-    description: 'Name for the deployment artifact (default: cdk-deployment-package)'
+    description: "Name for the deployment artifact (default: cdk-deployment-package)"
     required: false
-    default: 'cdk-deployment-package'
+    default: "cdk-deployment-package"
   artifact-path:
-    description: 'Path to store deployment files (default: deployment)'
+    description: "Path to store deployment files (default: deployment)"
     required: false
-    default: 'deployment'
+    default: "deployment"
   node-version:
-    description: 'Node.js version (default: 22)'
+    description: "Node.js version (default: 22)"
     required: false
-    default: '22'
-
-outputs:
-  stacks:
-    description: 'JSON array of stacks that were synthesized'
-    value: ${{ steps.stack-analysis.outputs.stacks }}
-  dependencies:
-    description: 'JSON object of stack dependencies'
-    value: ${{ steps.stack-analysis.outputs.dependencies }}
-  cache-hit:
-    description: 'Whether the npm cache was hit'
-    value: ${{ steps.setup-node.outputs.cache-hit }}
+    default: "22"
 
 runs:
   using: composite
   steps:
     - name: Checkout Code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
     - name: Setup Node.js ${{ inputs.node-version }}
-      id: setup-node
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
@@ -57,7 +43,26 @@ runs:
 
     - name: Install Dependencies
       shell: bash
-      run: npm ci --prefer-offline --no-audit
+      run: |
+        npm ci \
+          --foreground-scripts \
+          --install-strategy=hoisted \
+          --no-audit \
+          --no-fund \
+          --no-progress \
+          --strict-peer-deps
+
+    - name: Cache CDK artifacts
+      uses: actions/cache@v4
+      id: cdk-cache
+      with:
+        path: |
+          cdk.out
+          node_modules/.cache
+        key: ${{ runner.os }}-cdk-${{ hashFiles('**/package-lock.json') }}-${{ hashFiles('**/*.ts') }}
+        restore-keys: |
+          ${{ runner.os }}-cdk-${{ hashFiles('**/package-lock.json') }}-
+          ${{ runner.os }}-cdk-
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -65,58 +70,50 @@ runs:
         aws-region: ${{ inputs.aws-region }}
         role-to-assume: ${{ inputs.role-to-assume }}
 
-    - name: Cache CDK Synth
-      id: cache-cdk-synth
-      uses: actions/cache@v4
-      with:
-        path: cdk.out
-        key: cdk-synth-${{ hashFiles('package-lock.json') }}
-
     - name: Synthesize CDK stacks
-      if: steps.cache-cdk-synth.outputs.cache-hit != 'true'
-      shell: bash
-      run: ${{ inputs.synth-command }}
-
-    - name: Analyze stacks and dependencies
-      id: stack-analysis
       shell: bash
       run: |
-        if [ -f "cdk.out/manifest.json" ]; then
-          # Extract stacks and dependencies in a single jq operation
-          MANIFEST_ANALYSIS=$(jq -r '
-            {
-              stacks: (.artifacts | to_entries | 
-                map(select(.key | endswith(".assets") | not) | 
-                select(.key != "Tree")) | map(.key)),
-              dependencies: (.artifacts | to_entries | 
-                map(select(.key | endswith(".assets") | not) | 
-                select(.key != "Tree")) | 
-                map({key: .key, deps: (.value.dependencies | 
-                  if . then map(select(. | endswith(".assets") | not) | 
-                  select(. != "Tree")) else [] end)}) | 
-                from_entries)
-            } | 
-            to_entries | 
-            map("echo \"" + .key + "=" + (.value | @json) + "\" >> $GITHUB_OUTPUT") | 
-            .[]
-          ' cdk.out/manifest.json)
+        ${{ inputs.synth-command }} --no-version-reporting --no-path-metadata
+
+    - name: Analyze stacks and create summary
+      shell: bash
+      run: |
+        echo "## 🚀 CDK Stack Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Stacks Overview" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Stack Name | Dependencies | Region |" >> $GITHUB_STEP_SUMMARY
+        echo "|------------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
+
+        node -e '
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("cdk.out/manifest.json", "utf8"));
           
-          eval "$MANIFEST_ANALYSIS"
-        else
-          echo "::error::manifest.json not found in cdk.out directory"
-          exit 1
-        fi
+          Object.entries(manifest.artifacts)
+            .filter(([key, value]) => 
+              !key.endsWith(".assets") && 
+              key !== "Tree" && 
+              value.type === "aws:cloudformation:stack"
+            )
+            .forEach(([stack, info]) => {
+              const region = info.environment.match(/[^/]+$/)[0];
+              const dependencies = (info.dependencies || [])
+                .filter(dep => !dep.endsWith(".assets") && dep !== "Tree")
+                .sort()
+                .map(dep => `\`${dep}\``)
+                .join(", ");
+              
+              const depsColumn = dependencies ? dependencies : "";
+              console.log(`| \`${stack}\` | ${depsColumn} | ${region} |`);
+            });
+        ' >> $GITHUB_STEP_SUMMARY
 
     - name: Prepare deployment package
       shell: bash
       run: |
-        # Create deployment directory
         mkdir -p ${{ inputs.artifact-path }}
-        
-        # Copy CDK output
         cp -r cdk.out ${{ inputs.artifact-path }}/
-        
-        # Create minimal package.json
+
         node -e '
           const fs = require("fs");
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
@@ -129,17 +126,22 @@ runs:
           };
           fs.writeFileSync("${{ inputs.artifact-path }}/package.json", JSON.stringify(minPkg, null, 2));
         '
-        
-        # Install only production dependencies
+
         cd ${{ inputs.artifact-path }}
-        npm install --production --no-package-lock
-        
-        # Optimize node_modules size
+        npm install \
+          --foreground-scripts \
+          --install-strategy=hoisted \
+          --no-audit \
+          --no-fund \
+          --no-package-lock \
+          --no-progress \
+          --production \
+          --strict-peer-deps
+
+        # Clean up unnecessary files
         find node_modules -type d -name "test" -o -name "tests" -o -name "docs" -o -name "examples" | xargs rm -rf 2>/dev/null || true
         find node_modules -type f -name "*.md" -o -name "*.markdown" -o -name "*.txt" -o -name "*.map" -o -name "*.ts" -not -name "*.d.ts" | xargs rm -f 2>/dev/null || true
-        
-        # Create a marker file with metadata
-        echo "{\"createdAt\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\", \"region\": \"${{ inputs.aws-region }}\"}" > metadata.json
+        find node_modules -type f -name "*.log" -o -name "*.npmignore" -o -name "*.gitignore" | xargs rm -f 2>/dev/null || true
 
     - name: Upload deployment package
       uses: actions/upload-artifact@v4
@@ -147,3 +149,4 @@ runs:
         name: ${{ inputs.artifact-name }}
         path: ${{ inputs.artifact-path }}
         retention-days: 1
+        compression-level: 9
