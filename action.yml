@@ -1,5 +1,5 @@
-name: "CDK Prepare Environment"
-description: "Prepares AWS CDK environment with optimized caching and minimal dependencies"
+name: "CDK Prepare"
+description: "Prepares AWS CDK environment and creates a deployment package"
 branding:
   icon: "arrow-up-circle"
   color: "blue"
@@ -12,17 +12,13 @@ inputs:
     description: "AWS IAM role ARN to assume"
     required: true
   synth-command:
-    description: "CDK synthesis command (default: npx cdk synth)"
+    description: "CDK synthesis command (default: npm run synth)"
     required: false
-    default: "npx cdk synth"
+    default: "npm run synth"
   artifact-name:
     description: "Name for the deployment artifact (default: cdk-deployment-package)"
     required: false
     default: "cdk-deployment-package"
-  artifact-path:
-    description: "Path to store deployment files (default: deployment)"
-    required: false
-    default: "deployment"
   node-version:
     description: "Node.js version (default: 22)"
     required: false
@@ -43,26 +39,7 @@ runs:
 
     - name: Install Dependencies
       shell: bash
-      run: |
-        npm ci \
-          --foreground-scripts \
-          --install-strategy=hoisted \
-          --no-audit \
-          --no-fund \
-          --no-progress \
-          --strict-peer-deps
-
-    - name: Cache CDK artifacts
-      uses: actions/cache@v4
-      id: cdk-cache
-      with:
-        path: |
-          cdk.out
-          node_modules/.cache
-        key: ${{ runner.os }}-cdk-${{ hashFiles('**/package-lock.json') }}-${{ hashFiles('**/*.ts') }}
-        restore-keys: |
-          ${{ runner.os }}-cdk-${{ hashFiles('**/package-lock.json') }}-
-          ${{ runner.os }}-cdk-
+      run: npm ci
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -72,81 +49,30 @@ runs:
 
     - name: Synthesize CDK stacks
       shell: bash
-      run: |
-        ${{ inputs.synth-command }} --no-version-reporting --no-path-metadata
+      run: ${{ inputs.synth-command }} --no-version-reporting --no-path-metadata
 
     - name: Analyze stacks and create summary
       shell: bash
       run: |
-        echo "## 🚀 CDK Stack Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Stacks Overview" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
         echo "| Stack Name | Dependencies | Region |" >> $GITHUB_STEP_SUMMARY
         echo "|------------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
-
-        node -e '
-          const fs = require("fs");
-          const manifest = JSON.parse(fs.readFileSync("cdk.out/manifest.json", "utf8"));
-          
-          Object.entries(manifest.artifacts)
-            .filter(([key, value]) => 
-              !key.endsWith(".assets") && 
-              key !== "Tree" && 
-              value.type === "aws:cloudformation:stack"
-            )
-            .forEach(([stack, info]) => {
-              const region = info.environment.match(/[^/]+$/)[0];
-              const dependencies = (info.dependencies || [])
-                .filter(dep => !dep.endsWith(".assets") && dep !== "Tree")
-                .sort()
-                .map(dep => `\`${dep}\``)
-                .join(", ");
-              
-              const depsColumn = dependencies ? dependencies : "";
-              console.log(`| \`${stack}\` | ${depsColumn} | ${region} |`);
-            });
-        ' >> $GITHUB_STEP_SUMMARY
-
-    - name: Prepare deployment package
-      shell: bash
-      run: |
-        mkdir -p ${{ inputs.artifact-path }}
-        cp -r cdk.out ${{ inputs.artifact-path }}/
-
-        node -e '
-          const fs = require("fs");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const minPkg = {
-            name: pkg.name,
-            version: pkg.version,
-            dependencies: {
-              "aws-cdk": pkg.dependencies["aws-cdk"] || pkg.devDependencies["aws-cdk"]
-            }
-          };
-          fs.writeFileSync("${{ inputs.artifact-path }}/package.json", JSON.stringify(minPkg, null, 2));
-        '
-
-        cd ${{ inputs.artifact-path }}
-        npm install \
-          --foreground-scripts \
-          --install-strategy=hoisted \
-          --no-audit \
-          --no-fund \
-          --no-package-lock \
-          --no-progress \
-          --production \
-          --strict-peer-deps
-
-        # Clean up unnecessary files
-        find node_modules -type d -name "test" -o -name "tests" -o -name "docs" -o -name "examples" | xargs rm -rf 2>/dev/null || true
-        find node_modules -type f -name "*.md" -o -name "*.markdown" -o -name "*.txt" -o -name "*.map" -o -name "*.ts" -not -name "*.d.ts" | xargs rm -f 2>/dev/null || true
-        find node_modules -type f -name "*.log" -o -name "*.npmignore" -o -name "*.gitignore" | xargs rm -f 2>/dev/null || true
+        jq -r '.artifacts | to_entries[] | 
+          select(.key | endswith(".assets") | not) | 
+          select(.key != "Tree") | 
+          select(.value.type == "aws:cloudformation:stack") | 
+          "| `\(.key)` | \(.value.dependencies // [] | 
+            map(select(. | endswith(".assets") | not) | 
+            select(. != "Tree")) | 
+            sort | 
+            map("`\(.)`") | 
+            join(", ")) | \(.value.environment | capture("(?<region>[^/]+)$").region) |"' \
+          cdk.out/manifest.json >> $GITHUB_STEP_SUMMARY
 
     - name: Upload deployment package
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}
-        path: ${{ inputs.artifact-path }}
+        path: cdk.out
         retention-days: 1
         compression-level: 9
